@@ -904,7 +904,7 @@ mod tests {
         let reaction = ReactionEventContent::new(Annotation::new(event_id.into(), "🐈".to_owned()));
         room.send(reaction, None).await.expect("Sending the reaction should not fail");
 
-        room.send_raw(json!({}), "m.reaction", None)
+        room.send_raw(json!({}), "m.reaction", None, None)
             .await
             .expect("Sending the reaction should not fail");
     }

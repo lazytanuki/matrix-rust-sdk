@@ -28,7 +28,7 @@ use ruma::{
         StateEventContent,
     },
     serde::Raw,
-    EventId, OwnedTransactionId, TransactionId, UserId,
+    EventId, MilliSecondsSinceUnixEpoch, OwnedTransactionId, TransactionId, UserId,
 };
 use serde_json::Value;
 use tracing::debug;
@@ -497,7 +497,7 @@ impl Joined {
         let event_type = content.event_type().to_string();
         let content = serde_json::to_value(&content)?;
 
-        self.send_raw(content, &event_type, txn_id).await
+        self.send_raw(content, &event_type, txn_id, None).await
     }
 
     /// Send a room message to this room from a json `Value`.
@@ -561,6 +561,7 @@ impl Joined {
         content: Value,
         event_type: &str,
         txn_id: Option<&TransactionId>,
+        timestamp: Option<MilliSecondsSinceUnixEpoch>,
     ) -> Result<send_message_event::v3::Response> {
         let txn_id: OwnedTransactionId = txn_id.map_or_else(TransactionId::new, ToOwned::to_owned);
 
@@ -612,12 +613,13 @@ impl Joined {
             (Raw::new(&content)?.cast(), event_type)
         };
 
-        let request = send_message_event::v3::Request::new_raw(
+        let mut request = send_message_event::v3::Request::new_raw(
             self.inner.room_id().to_owned(),
             txn_id,
             event_type.into(),
             content,
         );
+        request.timestamp = timestamp;
 
         let response = self.client.send(request, None).await?;
         Ok(response)
