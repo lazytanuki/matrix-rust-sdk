@@ -497,7 +497,7 @@ impl Joined {
         let event_type = content.event_type().to_string();
         let content = serde_json::to_value(&content)?;
 
-        self.send_raw(content, &event_type, txn_id, None).await
+        self.send_raw(content, &event_type, txn_id, &None).await
     }
 
     /// Send a room message to this room from a json `Value`.
@@ -561,7 +561,7 @@ impl Joined {
         content: Value,
         event_type: &str,
         txn_id: Option<&TransactionId>,
-        timestamp: Option<MilliSecondsSinceUnixEpoch>,
+        timestamp: &Option<MilliSecondsSinceUnixEpoch>,
     ) -> Result<send_message_event::v3::Response> {
         let txn_id: OwnedTransactionId = txn_id.map_or_else(TransactionId::new, ToOwned::to_owned);
 
@@ -619,7 +619,7 @@ impl Joined {
             event_type.into(),
             content,
         );
-        request.timestamp = timestamp;
+        request.timestamp = *timestamp;
 
         let response = self.client.send(request, None).await?;
         Ok(response)
@@ -725,6 +725,107 @@ impl Joined {
         }
     }
 
+    /// Send an attachment to this room.
+    ///
+    /// This will upload the given data that the reader produces using the
+    /// [`upload()`](#method.upload) method and post an event to the given room.
+    /// If the room is encrypted and the encryption feature is enabled the
+    /// upload will be encrypted.
+    ///
+    /// This is a convenience method that calls the
+    /// [`Client::upload()`](#Client::method.upload) and afterwards the
+    /// [`send()`](#method.send).
+    ///
+    /// # Arguments
+    /// * `body` - A textual representation of the media that is going to be
+    /// uploaded. Usually the file name.
+    ///
+    /// * `content_type` - The type of the media, this will be used as the
+    /// content-type header.
+    ///
+    /// * `reader` - A `Reader` that will be used to fetch the raw bytes of the
+    /// media.
+    ///
+    /// * `config` - Metadata and configuration for the attachment.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::fs;
+    /// # use matrix_sdk::{Client, ruma::room_id, attachment::AttachmentConfig};
+    /// # use url::Url;
+    /// # use mime;
+    /// # use futures::executor::block_on;
+    /// # block_on(async {
+    /// # let homeserver = Url::parse("http://localhost:8080")?;
+    /// # let mut client = Client::new(homeserver).await?;
+    /// # let room_id = room_id!("!test:localhost");
+    /// let mut image = fs::read("/home/example/my-cat.jpg")?;
+    ///
+    /// if let Some(room) = client.get_joined_room(&room_id) {
+    ///     room.send_attachment(
+    ///         "My favorite cat",
+    ///         &mime::IMAGE_JPEG,
+    ///         image,
+    ///         AttachmentConfig::new(),
+    ///     ).await?;
+    /// }
+    /// # anyhow::Ok(()) });
+    /// ```
+    pub async fn send_attachment_raw(
+        &self,
+        body: &str,
+        content_type: &Mime,
+        data: Vec<u8>,
+        config: AttachmentConfig,
+        timestamp: Option<MilliSecondsSinceUnixEpoch>,
+    ) -> Result<send_message_event::v3::Response> {
+        if config.thumbnail.is_some() {
+            self.prepare_and_send_attachment_raw(body, content_type, data, config, &timestamp).await
+        } else {
+            #[cfg(not(feature = "image-proc"))]
+            let thumbnail = None;
+
+            #[cfg(feature = "image-proc")]
+            let data_slot;
+            #[cfg(feature = "image-proc")]
+            let thumbnail = if config.generate_thumbnail {
+                match generate_image_thumbnail(
+                    content_type,
+                    Cursor::new(&data),
+                    config.thumbnail_size,
+                ) {
+                    Ok((thumbnail_data, thumbnail_info)) => {
+                        data_slot = thumbnail_data;
+                        Some(Thumbnail {
+                            data: data_slot,
+                            content_type: mime::IMAGE_JPEG,
+                            info: Some(thumbnail_info),
+                        })
+                    }
+                    Err(
+                        ImageError::ThumbnailBiggerThanOriginal | ImageError::FormatNotSupported,
+                    ) => None,
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                None
+            };
+
+            let config = AttachmentConfig {
+                txn_id: config.txn_id,
+                info: config.info,
+                thumbnail,
+                #[cfg(feature = "image-proc")]
+                generate_thumbnail: false,
+                #[cfg(feature = "image-proc")]
+                thumbnail_size: None,
+            };
+
+            self.prepare_and_send_attachment_raw(body, content_type, data, config, &timestamp).await
+        }
+    }
+
     /// Prepare and send an attachment to this room.
     ///
     /// This will upload the given data that the reader produces using the
@@ -780,6 +881,65 @@ impl Joined {
             .await?;
 
         self.send(RoomMessageEventContent::new(content), config.txn_id.as_deref()).await
+    }
+
+    /// Prepare and send an attachment to this room.
+    ///
+    /// This will upload the given data that the reader produces using the
+    /// [`upload()`](#method.upload) method and post an event to the given room.
+    /// If the room is encrypted and the encryption feature is enabled the
+    /// upload will be encrypted.
+    ///
+    /// This is a convenience method that calls the
+    /// [`Client::upload()`](#Client::method.upload) and afterwards the
+    /// [`send()`](#method.send).
+    ///
+    /// # Arguments
+    /// * `body` - A textual representation of the media that is going to be
+    /// uploaded. Usually the file name.
+    ///
+    /// * `content_type` - The type of the media, this will be used as the
+    /// content-type header.
+    ///
+    /// * `reader` - A `Reader` that will be used to fetch the raw bytes of the
+    /// media.
+    ///
+    /// * `config` - Metadata and configuration for the attachment.
+    async fn prepare_and_send_attachment_raw(
+        &self,
+        body: &str,
+        content_type: &Mime,
+        data: Vec<u8>,
+        config: AttachmentConfig,
+        timestamp: &Option<MilliSecondsSinceUnixEpoch>,
+    ) -> Result<send_message_event::v3::Response> {
+        #[cfg(feature = "e2e-encryption")]
+        let content = if self.is_encrypted().await? {
+            self.client
+                .prepare_encrypted_attachment_message(
+                    body,
+                    content_type,
+                    data,
+                    config.info,
+                    config.thumbnail,
+                )
+                .await?
+        } else {
+            self.client
+                .media()
+                .prepare_attachment_message(body, content_type, data, config.info, config.thumbnail)
+                .await?
+        };
+
+        #[cfg(not(feature = "e2e-encryption"))]
+        let content = self
+            .client
+            .media()
+            .prepare_attachment_message(body, content_type, data, config.info, config.thumbnail)
+            .await?;
+        let content_json = serde_json::to_value(content)?;
+
+        self.send_raw(content_json, "m.room.message", config.txn_id.as_deref(), timestamp).await
     }
 
     /// Send a state event with an empty state key to the homeserver.
