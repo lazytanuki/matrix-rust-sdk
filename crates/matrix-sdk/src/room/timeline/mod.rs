@@ -16,18 +16,18 @@
 //!
 //! See [`Timeline`] for details.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex as StdMutex},
-};
+use std::sync::Arc;
 
 use futures_core::Stream;
 use futures_signals::signal_vec::{SignalVec, SignalVecExt, VecDiff};
-use matrix_sdk_base::deserialized_responses::{EncryptionInfo, SyncTimelineEvent};
+use matrix_sdk_base::{
+    deserialized_responses::{EncryptionInfo, SyncTimelineEvent},
+    locks::Mutex,
+};
 use ruma::{
     assign,
-    events::{fully_read::FullyReadEventContent, relation::Annotation, AnyMessageLikeEventContent},
-    EventId, OwnedEventId, OwnedUserId, TransactionId, UInt,
+    events::{fully_read::FullyReadEventContent, AnyMessageLikeEventContent},
+    EventId, TransactionId, UInt,
 };
 use tracing::{error, instrument};
 
@@ -55,7 +55,7 @@ pub use self::{
     virtual_item::VirtualTimelineItem,
 };
 use self::{
-    inner::TimelineInner,
+    inner::{TimelineInner, TimelineInnerMetadata},
     to_device::{handle_forwarded_room_key_event, handle_room_key_event},
 };
 
@@ -68,8 +68,8 @@ use self::{
 pub struct Timeline {
     inner: Arc<TimelineInner>,
     room: room::Common,
-    start_token: StdMutex<Option<String>>,
-    _end_token: StdMutex<Option<String>>,
+    start_token: Mutex<Option<String>>,
+    _end_token: Mutex<Option<String>>,
     event_handler_handles: Vec<EventHandlerHandle>,
 }
 
@@ -79,15 +79,6 @@ impl Drop for Timeline {
             self.room.client.remove_event_handler(handle);
         }
     }
-}
-
-/// Non-signalling parts of `TimelineInner`.
-#[derive(Debug, Default)]
-struct TimelineInnerMetadata {
-    // Reaction event / txn ID => sender and reaction data
-    reaction_map: HashMap<TimelineKey, (OwnedUserId, Annotation)>,
-    fully_read_event: Option<OwnedEventId>,
-    fully_read_event_in_timeline: bool,
 }
 
 impl Timeline {
@@ -137,8 +128,8 @@ impl Timeline {
         Timeline {
             inner,
             room: room.clone(),
-            start_token: StdMutex::new(prev_token),
-            _end_token: StdMutex::new(None),
+            start_token: Mutex::new(prev_token),
+            _end_token: Mutex::new(None),
             event_handler_handles,
         }
     }
@@ -175,22 +166,25 @@ impl Timeline {
     /// Add more events to the start of the timeline.
     #[instrument(skip(self), fields(room_id = %self.room.room_id()))]
     pub async fn paginate_backwards(&self, limit: UInt) -> Result<PaginationOutcome> {
-        let start = self.start_token.lock().unwrap().clone();
+        let mut start_lock = self.start_token.lock().await;
+        self.inner.add_loading_indicator();
         let messages = self
             .room
             .messages(assign!(MessagesOptions::backward(), {
-                from: start,
+                from: start_lock.clone(),
                 limit,
             }))
             .await?;
 
-        let outcome = PaginationOutcome { more_messages: messages.end.is_some() };
-        *self.start_token.lock().unwrap() = messages.end;
-
         let own_user_id = self.room.own_user_id();
+        let mut num_updates = 0;
         for room_ev in messages.chunk {
-            self.inner.handle_back_paginated_event(room_ev, own_user_id).await;
+            num_updates += self.inner.handle_back_paginated_event(room_ev, own_user_id).await;
         }
+
+        self.inner.remove_loading_indicator();
+        let outcome = PaginationOutcome { more_messages: messages.end.is_some(), num_updates };
+        *start_lock = messages.end;
 
         Ok(outcome)
     }
@@ -335,6 +329,14 @@ impl TimelineItem {
             _ => None,
         }
     }
+
+    fn loading_indicator() -> Self {
+        Self::Virtual(VirtualTimelineItem::LoadingIndicator)
+    }
+
+    fn is_loading_indicator(&self) -> bool {
+        matches!(self, Self::Virtual(VirtualTimelineItem::LoadingIndicator))
+    }
 }
 
 /// The result of a successful pagination request.
@@ -344,6 +346,13 @@ impl TimelineItem {
 pub struct PaginationOutcome {
     /// Whether there's more messages to be paginated.
     pub more_messages: bool,
+
+    /// The number of timeline updates to expect from this pagination.
+    ///
+    /// Since timeline updates are received asynchronously, you can use this
+    /// number to determine whether all updates have been observed, and whether
+    /// another back pagination request should be made.
+    pub num_updates: u16,
 }
 
 // FIXME: Put an upper bound on timeline size or add a separate map to look up
